@@ -4,7 +4,7 @@
 //  Global Solution 2026/1 — Space Connect
 // ============================================================
 
-#include <Arduino.h>          // obrigatório no PlatformIO
+#include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
@@ -16,23 +16,16 @@
 const char* SSID      = "Wokwi-GUEST";
 const char* PASSWORD  = "";
 
-// Enquanto a API não estiver em produção, troque pela URL do deploy
 const char* API_BASE  = "https://sua-api.railway.app";
-
-// MAC fixo para simulação no Wokwi
-// Em hardware físico substituir por: WiFi.macAddress()
 const char* DEVICE_MAC = "AA:BB:CC:DD:EE:FF";
 
 // ============ PINOS ============
 #define DHT_PIN       4   // ENTRADA 1 — DHT22 (temperatura + umidade do ar)
-#define SOIL_PIN      34  // ENTRADA 2 — Sensor de umidade do solo (analógico)
+#define SOIL_PIN      34  // ENTRADA 2 — Joystick VRX simula sensor capacitivo de umidade do solo
+                          //             Em hardware físico: substituir por sensor YL-69 ou similar
 
-#define LED_VALID_G   25  // SAÍDA 1a — LED verde  (dispositivo validado)
-#define LED_VALID_R   26  // SAÍDA 1b — LED vermelho (aguardando validação)
-
-#define LED_RISK_G    27  // SAÍDA 2a — LED verde  (risco baixo)
-#define LED_RISK_Y    14  // SAÍDA 2b — LED amarelo (atenção)
-#define LED_RISK_R    12  // SAÍDA 2c — LED vermelho (risco alto)
+#define LED_VALID_G   25  // SAÍDA 1 — LED verde:    dispositivo registrado e enviando dados
+#define LED_VALID_R   26  // SAÍDA 2 — LED vermelho: pisca = conectando Wi-Fi | fixo = aguardando registro
 
 // ============ OBJETOS ============
 DHT               dht(DHT_PIN, DHT22);
@@ -46,17 +39,21 @@ String  deviceName      = "Sonda";
 float   soilMoisture    = 0.0;
 float   temperature     = 0.0;
 float   airHumidity     = 0.0;
-String  riskLevel       = "unknown";  // "green" | "yellow" | "red" | "unknown"
+String  riskLevel       = "unknown";
 String  recommendation  = "";
 
 unsigned long lastSensorRead = 0;
 unsigned long lastApiPoll    = 0;
-const long    SENSOR_INTERVAL   = 2000;   // leitura a cada 2s
-const long    API_POLL_INTERVAL = 10000;  // poll da API a cada 10s
+unsigned long lastBlinkTime  = 0;
+bool          blinkState     = false;
+
+const long SENSOR_INTERVAL   = 2000;
+const long API_POLL_INTERVAL = 10000;
+const long BLINK_INTERVAL    = 500;   // pisca a cada 500ms enquanto conecta Wi-Fi
 
 // ============ DECLARAÇÕES ANTECIPADAS ============
 void setValidationLED(bool validated);
-void setRiskLED(String level);
+void updateBlinkLED();
 void lcdPrint(String linha1, String linha2);
 void updateDisplay();
 void readSensors();
@@ -77,13 +74,10 @@ void setup() {
   // --- Pinos de saída ---
   pinMode(LED_VALID_G, OUTPUT);
   pinMode(LED_VALID_R, OUTPUT);
-  pinMode(LED_RISK_G,  OUTPUT);
-  pinMode(LED_RISK_Y,  OUTPUT);
-  pinMode(LED_RISK_R,  OUTPUT);
 
-  // Estado inicial: não validado, risco desconhecido
-  setValidationLED(false);
-  setRiskLED("unknown");
+  // Estado inicial: vermelho piscando (conectando)
+  digitalWrite(LED_VALID_G, LOW);
+  digitalWrite(LED_VALID_R, HIGH);
 
   // --- DHT22 ---
   dht.begin();
@@ -95,24 +89,20 @@ void setup() {
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("HarvestEye Ativo");
-
   delay(2000);
 
-  // --- Wi-Fi ---
+  // --- Wi-Fi (não bloqueante) ---
   Serial.println("Conectando ao Wi-Fi...");
   WiFi.begin(SSID, PASSWORD);
+  lcdPrint("Conectando...", "Wi-Fi: aguardando");
 
-  lcdPrint("Modo Offline", "Aguard. registro");
-
-  // --- WebServer: 3 endpoints obrigatórios + dashboard ---
-  server.on("/",               HTTP_GET,  handleDashboard);   // Dashboard HTML
-  server.on("/sensor/leitura", HTTP_GET,  handleGetLeitura);  // EP 1 — leitura atual
-  server.on("/sensor/status",  HTTP_GET,  handleGetStatus);   // EP 2 — status do device
-  server.on("/sensor/config",  HTTP_POST, handlePostConfig);  // EP 3 — receber config
-
+  // --- WebServer ---
+  server.on("/",               HTTP_GET,  handleDashboard);
+  server.on("/sensor/leitura", HTTP_GET,  handleGetLeitura);
+  server.on("/sensor/status",  HTTP_GET,  handleGetStatus);
+  server.on("/sensor/config",  HTTP_POST, handlePostConfig);
   server.begin();
   Serial.println("WebServer iniciado na porta 80");
-
 }
 
 // ============================================================
@@ -123,6 +113,22 @@ void loop() {
 
   unsigned long now = millis();
 
+  // Piscar LED vermelho enquanto Wi-Fi não conectar
+  updateBlinkLED();
+
+  // Quando Wi-Fi conectar pela primeira vez, atualiza LED e LCD
+  static bool wifiWasConnected = false;
+  if (WiFi.status() == WL_CONNECTED && !wifiWasConnected) {
+    wifiWasConnected = true;
+    // Wi-Fi conectado mas ainda sem validação: LED vermelho FIXO (para de piscar)
+    if (!deviceValidated) {
+      digitalWrite(LED_VALID_R, HIGH);
+    }
+    Serial.println("Wi-Fi conectado: " + WiFi.localIP().toString());
+    lcdPrint("Wi-Fi OK", WiFi.localIP().toString().substring(0, 16));
+    delay(1500);
+  }
+
   // Leitura periódica dos sensores
   if (now - lastSensorRead >= SENSOR_INTERVAL) {
     readSensors();
@@ -130,7 +136,7 @@ void loop() {
     lastSensorRead = now;
   }
 
-  // Poll periódico da API (validação + recomendação)
+  // Poll periódico da API
   if (WiFi.status() == WL_CONNECTED && now - lastApiPoll >= API_POLL_INTERVAL) {
     pollDeviceStatus();
     if (deviceValidated) {
@@ -141,21 +147,27 @@ void loop() {
 }
 
 // ============================================================
-//  SENSORES
+//  LED — VALIDAÇÃO
 // ============================================================
-void readSensors() {
-  // DHT22 — temperatura e umidade do ar
-  float t = dht.readTemperature();
-  float h = dht.readHumidity();
-  if (!isnan(t)) temperature = t;
-  if (!isnan(h)) airHumidity = h;
 
-  // Solo — converte ADC (0–4095) para % de umidade (0–100)
-  int raw = analogRead(SOIL_PIN);
-  soilMoisture = map(raw, 4095, 0, 0, 100);
+// Saída 1 (verde) + Saída 2 (vermelho)
+void setValidationLED(bool validated) {
+  digitalWrite(LED_VALID_G, validated ? HIGH : LOW);
+  digitalWrite(LED_VALID_R, validated ? LOW  : HIGH);
+}
 
-  Serial.printf("[Sensores] Solo: %.1f%% | Temp: %.1f°C | UmAr: %.1f%%\n",
-                soilMoisture, temperature, airHumidity);
+// Pisca o LED vermelho enquanto Wi-Fi está conectando
+void updateBlinkLED() {
+  if (deviceValidated) return; // se validado, LEDs já estão fixos
+  if (WiFi.status() == WL_CONNECTED) return; // Wi-Fi conectado = LED fixo, não pisca
+
+  unsigned long now = millis();
+  if (now - lastBlinkTime >= BLINK_INTERVAL) {
+    blinkState = !blinkState;
+    digitalWrite(LED_VALID_R, blinkState ? HIGH : LOW);
+    digitalWrite(LED_VALID_G, LOW);
+    lastBlinkTime = now;
+  }
 }
 
 // ============================================================
@@ -175,24 +187,25 @@ void updateDisplay() {
   } else {
     String statusStr = riskLevel == "green"  ? "[OK]" :
                        riskLevel == "yellow" ? "[AT]" : "[RI]";
-    String linha1 = deviceName.substring(0, 11) + " " + statusStr;
-    String linha2 = "S:" + String((int)soilMoisture) + "% T:" + String((int)temperature) + "C";
-    lcdPrint(linha1, linha2);
+    lcdPrint(deviceName.substring(0, 11) + " " + statusStr,
+             "S:" + String((int)soilMoisture) + "% T:" + String((int)temperature) + "C");
   }
 }
 
 // ============================================================
-//  LEDs
+//  SENSORES
 // ============================================================
-void setValidationLED(bool validated) {
-  digitalWrite(LED_VALID_G, validated ? HIGH : LOW);
-  digitalWrite(LED_VALID_R, validated ? LOW  : HIGH);
-}
+void readSensors() {
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  if (!isnan(t)) temperature = t;
+  if (!isnan(h)) airHumidity = h;
 
-void setRiskLED(String level) {
-  digitalWrite(LED_RISK_G, level == "green"  ? HIGH : LOW);
-  digitalWrite(LED_RISK_Y, level == "yellow" ? HIGH : LOW);
-  digitalWrite(LED_RISK_R, level == "red"    ? HIGH : LOW);
+  int raw = analogRead(SOIL_PIN);
+  soilMoisture = map(raw, 4095, 0, 0, 100);
+
+  Serial.printf("[Sensores] Solo: %.1f%% | Temp: %.1f°C | UmAr: %.1f%%\n",
+                soilMoisture, temperature, airHumidity);
 }
 
 // ============================================================
@@ -200,23 +213,19 @@ void setRiskLED(String level) {
 // ============================================================
 void pollDeviceStatus() {
   HTTPClient http;
-  String url = String(API_BASE) + "/device/status?mac=" + DEVICE_MAC;
-  http.begin(url);
+  http.begin(String(API_BASE) + "/device/status?mac=" + DEVICE_MAC);
   int code = http.GET();
-
   Serial.println("[API] GET /device/status → HTTP " + String(code));
 
   if (code == 200) {
-    String body = http.getString();
     JsonDocument doc;
-    deserializeJson(doc, body);
+    deserializeJson(doc, http.getString());
 
     bool validated = doc["validado"] | false;
-
     if (validated != deviceValidated) {
       deviceValidated = validated;
       setValidationLED(deviceValidated);
-      Serial.println(deviceValidated ? "[LED] Dispositivo VALIDADO" : "[LED] Aguardando validacao");
+      Serial.println(deviceValidated ? "[LED] VERDE — Dispositivo validado" : "[LED] VERMELHO — Aguardando registro");
     }
 
     if (deviceValidated) {
@@ -224,11 +233,9 @@ void pollDeviceStatus() {
       deviceName     = doc["nome"]         | "Sonda";
       riskLevel      = doc["risco"]        | "unknown";
       recommendation = doc["recomendacao"] | "";
-      setRiskLED(riskLevel);
       Serial.println("[Risco] " + riskLevel + " | " + recommendation);
     }
   }
-
   http.end();
 }
 
@@ -249,7 +256,6 @@ void sendSensorData() {
 
   int code = http.POST(body);
   Serial.println("[API] POST /sensor/leitura → HTTP " + String(code));
-
   http.end();
 }
 
@@ -257,10 +263,11 @@ void sendSensorData() {
 //  WEBSERVER — ENDPOINTS
 // ============================================================
 void handleDashboard() {
-  String validStr = deviceValidated ? "&#9989; Validado" : "&#128308; Aguardando registro";
-  String riscoStr = riskLevel == "green"  ? "&#128994; Baixo"   :
-                    riskLevel == "yellow" ? "&#129000; Atencao" :
-                    riskLevel == "red"    ? "&#128308; Alto"    : "Desconhecido";
+  String wifiStr   = WiFi.status() == WL_CONNECTED ? "Conectado (" + WiFi.localIP().toString() + ")" : "Desconectado";
+  String validStr  = deviceValidated ? "&#9989; Validado" : "&#128308; Aguardando registro";
+  String riscoStr  = riskLevel == "green"  ? "&#128994; Baixo"   :
+                     riskLevel == "yellow" ? "&#129000; Atencao" :
+                     riskLevel == "red"    ? "&#128308; Alto"    : "Desconhecido";
 
   String html =
     "<!DOCTYPE html><html><head>"
@@ -273,6 +280,7 @@ void handleDashboard() {
     "h1{color:#1B4D3E}h3{color:#555;margin:4px 0}.val{font-size:1.4em;font-weight:bold;color:#1B4D3E}"
     "</style></head><body>"
     "<h1>&#127807; HarvestEye</h1>"
+    "<div class='card'><h3>Rede</h3><p>" + wifiStr + "</p></div>"
     "<div class='card'><h3>Dispositivo</h3>"
     "<p>" + validStr + " &nbsp; <b>" + deviceName + "</b></p></div>"
     "<div class='card'><h3>Sensores</h3>"
@@ -289,6 +297,7 @@ void handleDashboard() {
   server.send(200, "text/html", html);
 }
 
+// EP 1 — GET /sensor/leitura
 void handleGetLeitura() {
   JsonDocument doc;
   doc["mac"]          = DEVICE_MAC;
@@ -302,6 +311,7 @@ void handleGetLeitura() {
   server.send(200, "application/json", response);
 }
 
+// EP 2 — GET /sensor/status
 void handleGetStatus() {
   JsonDocument doc;
   doc["mac"]          = DEVICE_MAC;
@@ -310,12 +320,14 @@ void handleGetStatus() {
   doc["fieldId"]      = deviceFieldId;
   doc["risco"]        = riskLevel;
   doc["recomendacao"] = recommendation;
+  doc["wifi"]         = WiFi.status() == WL_CONNECTED;
 
   String response;
   serializeJson(doc, response);
   server.send(200, "application/json", response);
 }
 
+// EP 3 — POST /sensor/config
 void handlePostConfig() {
   if (!server.hasArg("plain")) {
     server.send(400, "application/json", "{\"error\":\"body ausente\"}");
@@ -323,9 +335,7 @@ void handlePostConfig() {
   }
 
   JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, server.arg("plain"));
-
-  if (err) {
+  if (deserializeJson(doc, server.arg("plain"))) {
     server.send(400, "application/json", "{\"error\":\"JSON invalido\"}");
     return;
   }
