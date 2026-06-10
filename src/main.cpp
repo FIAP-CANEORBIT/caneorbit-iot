@@ -2,6 +2,7 @@
 //  HarvestEye — IoT ESP32
 //  Disciplina: Disruptive Architectures (FIAP)
 //  Global Solution 2026/1 — Space Connect
+//  Integração: CaneOrbit API (Java — Render)
 // ============================================================
 
 #include <Arduino.h>
@@ -13,19 +14,22 @@
 #include <ArduinoJson.h>
 
 // ============ CONFIGURAÇÕES ============
-const char* SSID      = "Wokwi-GUEST";
-const char* PASSWORD  = "";
+const char* SSID     = "Wokwi-GUEST";
+const char* PASSWORD = "";
 
-const char* API_BASE  = "https://sua-api.railway.app";
-const char* DEVICE_MAC = "AA:BB:CC:DD:EE:FF";
+// API Java em produção (Render)
+const char* API_BASE = "https://caneorbis-api-java.onrender.com";
+
+// ID do dispositivo — obter após cadastrar via POST /api/dispositivos
+const int DEVICE_ID = 22;
 
 // ============ PINOS ============
-#define DHT_PIN       4   // ENTRADA 1 — DHT22 (temperatura + umidade do ar)
-#define SOIL_PIN      34  // ENTRADA 2 — Joystick VRX simula sensor capacitivo de umidade do solo
-                          //             Em hardware físico: substituir por sensor YL-69 ou similar
+#define DHT_PIN     4   // ENTRADA 1 — DHT22 (temperatura + umidade do ar)
+#define SOIL_PIN   34   // ENTRADA 2 — Joystick VRX simula sensor de umidade do solo
+#define PH_PIN     35   // ENTRADA 3 — Potenciômetro simula sensor de pH do solo
 
-#define LED_VALID_G   25  // SAÍDA 1 — LED verde:    dispositivo registrado e enviando dados
-#define LED_VALID_R   26  // SAÍDA 2 — LED vermelho: pisca = conectando Wi-Fi | fixo = aguardando registro
+#define LED_VALID_G 25  // SAÍDA 1 — LED verde:    POST à API ok
+#define LED_VALID_R 26  // SAÍDA 2 — LED vermelho: pisca = conectando | fixo = sem API
 
 // ============ OBJETOS ============
 DHT               dht(DHT_PIN, DHT22);
@@ -33,31 +37,30 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 WebServer         server(80);
 
 // ============ ESTADO GLOBAL ============
-bool    deviceValidated = false;
-String  deviceFieldId   = "";
-String  deviceName      = "Sonda";
-float   soilMoisture    = 0.0;
-float   temperature     = 0.0;
-float   airHumidity     = 0.0;
-String  riskLevel       = "unknown";
-String  recommendation  = "";
+bool    apiOk        = false;
+String  deviceName   = "Sonda";
+float   soilMoisture = 0.0;
+float   temperature  = 0.0;
+float   airHumidity  = 0.0;
+float   phSolo       = 7.0;
+String  riskLevel    = "unknown";
 
 unsigned long lastSensorRead = 0;
-unsigned long lastApiPoll    = 0;
+unsigned long lastApiPost    = 0;
 unsigned long lastBlinkTime  = 0;
 bool          blinkState     = false;
 
-const long SENSOR_INTERVAL   = 2000;
-const long API_POLL_INTERVAL = 10000;
-const long BLINK_INTERVAL    = 500;   // pisca a cada 500ms enquanto conecta Wi-Fi
+const long SENSOR_INTERVAL = 2000;
+const long API_INTERVAL    = 10000;
+const long BLINK_INTERVAL  = 500;   // pisca a cada 500ms enquanto conecta Wi-Fi
 
 // ============ DECLARAÇÕES ANTECIPADAS ============
-void setValidationLED(bool validated);
+void setValidationLED(bool ok);
 void updateBlinkLED();
+void calcularRisco();
 void lcdPrint(String linha1, String linha2);
 void updateDisplay();
 void readSensors();
-void pollDeviceStatus();
 void sendSensorData();
 void handleDashboard();
 void handleGetLeitura();
@@ -120,10 +123,7 @@ void loop() {
   static bool wifiWasConnected = false;
   if (WiFi.status() == WL_CONNECTED && !wifiWasConnected) {
     wifiWasConnected = true;
-    // Wi-Fi conectado mas ainda sem validação: LED vermelho FIXO (para de piscar)
-    if (!deviceValidated) {
-      digitalWrite(LED_VALID_R, HIGH);
-    }
+    if (!apiOk) digitalWrite(LED_VALID_R, HIGH); // fixo até confirmar API
     Serial.println("Wi-Fi conectado: " + WiFi.localIP().toString());
     lcdPrint("Wi-Fi OK", WiFi.localIP().toString().substring(0, 16));
     delay(1500);
@@ -132,34 +132,30 @@ void loop() {
   // Leitura periódica dos sensores
   if (now - lastSensorRead >= SENSOR_INTERVAL) {
     readSensors();
+    calcularRisco();
     updateDisplay();
     lastSensorRead = now;
   }
 
-  // Poll periódico da API
-  if (WiFi.status() == WL_CONNECTED && now - lastApiPoll >= API_POLL_INTERVAL) {
-    pollDeviceStatus();
-    if (deviceValidated) {
-      sendSensorData();
-    }
-    lastApiPoll = now;
+  // Envio periódico à API CaneOrbit
+  if (WiFi.status() == WL_CONNECTED && now - lastApiPost >= API_INTERVAL) {
+    sendSensorData();
+    lastApiPost = now;
   }
 }
 
 // ============================================================
-//  LED — VALIDAÇÃO
+//  LED — STATUS DA API
 // ============================================================
-
-// Saída 1 (verde) + Saída 2 (vermelho)
-void setValidationLED(bool validated) {
-  digitalWrite(LED_VALID_G, validated ? HIGH : LOW);
-  digitalWrite(LED_VALID_R, validated ? LOW  : HIGH);
+void setValidationLED(bool ok) {
+  digitalWrite(LED_VALID_G, ok ? HIGH : LOW);
+  digitalWrite(LED_VALID_R, ok ? LOW  : HIGH);
 }
 
 // Pisca o LED vermelho enquanto Wi-Fi está conectando
 void updateBlinkLED() {
-  if (deviceValidated) return; // se validado, LEDs já estão fixos
-  if (WiFi.status() == WL_CONNECTED) return; // Wi-Fi conectado = LED fixo, não pisca
+  if (apiOk) return;
+  if (WiFi.status() == WL_CONNECTED) return;
 
   unsigned long now = millis();
   if (now - lastBlinkTime >= BLINK_INTERVAL) {
@@ -182,14 +178,17 @@ void lcdPrint(String linha1, String linha2) {
 }
 
 void updateDisplay() {
-  if (!deviceValidated) {
-    lcdPrint("Ag. registro...", "S:" + String((int)soilMoisture) + "% T:" + String((int)temperature) + "C");
-  } else {
-    String statusStr = riskLevel == "green"  ? "[OK]" :
-                       riskLevel == "yellow" ? "[AT]" : "[RI]";
-    lcdPrint(deviceName.substring(0, 11) + " " + statusStr,
-             "S:" + String((int)soilMoisture) + "% T:" + String((int)temperature) + "C");
-  }
+  String statusStr = riskLevel == "green"  ? "[OK]" :
+                     riskLevel == "yellow" ? "[AT]" :
+                     riskLevel == "red"    ? "[RI]" : "[--]";
+
+  // Linha 1: umidade do solo + temperatura
+  String linha1 = "S:" + String((int)soilMoisture) + "% T:" + String((int)temperature) + "C";
+
+  // Linha 2: pH + status de risco
+  String linha2 = "pH:" + String(phSolo, 1) + " " + statusStr;
+
+  lcdPrint(linha1, linha2);
 }
 
 // ============================================================
@@ -201,61 +200,75 @@ void readSensors() {
   if (!isnan(t)) temperature = t;
   if (!isnan(h)) airHumidity = h;
 
-  int raw = analogRead(SOIL_PIN);
-  soilMoisture = map(raw, 4095, 0, 0, 100);
+  // Solo — joystick VRX: ADC 0–4095 → 0–100%
+  int rawSoil  = analogRead(SOIL_PIN);
+  soilMoisture = map(rawSoil, 4095, 0, 0, 100);
 
-  Serial.printf("[Sensores] Solo: %.1f%% | Temp: %.1f°C | UmAr: %.1f%%\n",
-                soilMoisture, temperature, airHumidity);
+  // pH — potenciômetro: ADC 0–4095 → pH 0.0–14.0
+  int rawPh = analogRead(PH_PIN);
+  phSolo    = rawPh * 14.0 / 4095.0;
+
+  Serial.printf("[Sensores] Solo: %.1f%% | Temp: %.1f°C | UmAr: %.1f%% | pH: %.1f\n",
+                soilMoisture, temperature, airHumidity, phSolo);
 }
 
 // ============================================================
-//  COMUNICAÇÃO COM A API
+//  CÁLCULO DE RISCO LOCAL
+//  pH ideal para cana-de-açúcar: 6.0–7.5
 // ============================================================
-void pollDeviceStatus() {
-  HTTPClient http;
-  http.begin(String(API_BASE) + "/device/status?mac=" + DEVICE_MAC);
-  int code = http.GET();
-  Serial.println("[API] GET /device/status → HTTP " + String(code));
+void calcularRisco() {
+  bool phCritico = (phSolo < 5.5 || phSolo > 8.5);
+  bool phAtencao = (phSolo < 6.0 || phSolo > 7.5);
+  bool soloSeco  = (soilMoisture < 20);
+  bool soloAtenc = (soilMoisture < 40);
+  bool tempAlta  = (temperature  > 38);
+  bool tempAtenc = (temperature  > 33);
 
-  if (code == 200) {
-    JsonDocument doc;
-    deserializeJson(doc, http.getString());
-
-    bool validated = doc["validado"] | false;
-    if (validated != deviceValidated) {
-      deviceValidated = validated;
-      setValidationLED(deviceValidated);
-      Serial.println(deviceValidated ? "[LED] VERDE — Dispositivo validado" : "[LED] VERMELHO — Aguardando registro");
-    }
-
-    if (deviceValidated) {
-      deviceFieldId  = doc["fieldId"]      | "";
-      deviceName     = doc["nome"]         | "Sonda";
-      riskLevel      = doc["risco"]        | "unknown";
-      recommendation = doc["recomendacao"] | "";
-      Serial.println("[Risco] " + riskLevel + " | " + recommendation);
-    }
+  if (soloSeco || tempAlta || phCritico) {
+    riskLevel = "red";
+  } else if (soloAtenc || tempAtenc || phAtencao) {
+    riskLevel = "yellow";
+  } else {
+    riskLevel = "green";
   }
-  http.end();
 }
 
+// ============================================================
+//  COMUNICAÇÃO COM A API — POST /api/leituras
+//
+//  Body enviado:
+//  {
+//    "idDispositivo": 1,
+//    "umidadeSolo":   45.5,
+//    "temperatura":   28.3,
+//    "phSolo":        6.2
+//  }
+//
+//  Resposta 200/201 → LED verde acende
+// ============================================================
 void sendSensorData() {
   HTTPClient http;
-  http.begin(String(API_BASE) + "/sensor/leitura");
+  http.begin(String(API_BASE) + "/api/leituras");
   http.addHeader("Content-Type", "application/json");
+  http.setTimeout(35000); // Render free tier pode demorar para acordar
 
   JsonDocument doc;
-  doc["mac"]          = DEVICE_MAC;
-  doc["fieldId"]      = deviceFieldId;
-  doc["umidade_solo"] = soilMoisture;
-  doc["temperatura"]  = temperature;
-  doc["umidade_ar"]   = airHumidity;
+  doc["idDispositivo"] = DEVICE_ID;
+  doc["umidadeSolo"]   = round(soilMoisture * 10) / 10.0;
+  doc["temperatura"]   = round(temperature  * 10) / 10.0;
+  doc["phSolo"]        = round(phSolo       * 10) / 10.0;
 
   String body;
   serializeJson(doc, body);
 
   int code = http.POST(body);
-  Serial.println("[API] POST /sensor/leitura → HTTP " + String(code));
+  Serial.println("[API] POST /api/leituras → HTTP " + String(code));
+  Serial.println("[API] Body: " + body);
+
+  // LED verde = sucesso (200 ou 201), vermelho = falha
+  apiOk = (code == 200 || code == 201);
+  setValidationLED(apiOk);
+
   http.end();
 }
 
@@ -263,11 +276,13 @@ void sendSensorData() {
 //  WEBSERVER — ENDPOINTS
 // ============================================================
 void handleDashboard() {
-  String wifiStr   = WiFi.status() == WL_CONNECTED ? "Conectado (" + WiFi.localIP().toString() + ")" : "Desconectado";
-  String validStr  = deviceValidated ? "&#9989; Validado" : "&#128308; Aguardando registro";
-  String riscoStr  = riskLevel == "green"  ? "&#128994; Baixo"   :
-                     riskLevel == "yellow" ? "&#129000; Atencao" :
-                     riskLevel == "red"    ? "&#128308; Alto"    : "Desconhecido";
+  String wifiStr  = WiFi.status() == WL_CONNECTED
+                    ? "Conectado (" + WiFi.localIP().toString() + ")"
+                    : "Desconectado";
+  String apiStr   = apiOk ? "&#9989; Conectado" : "&#128308; Aguardando envio";
+  String riscoStr = riskLevel == "green"  ? "&#128994; Baixo"   :
+                    riskLevel == "yellow" ? "&#129000; Atencao" :
+                    riskLevel == "red"    ? "&#128308; Alto"    : "Desconhecido";
 
   String html =
     "<!DOCTYPE html><html><head>"
@@ -281,16 +296,15 @@ void handleDashboard() {
     "</style></head><body>"
     "<h1>&#127807; HarvestEye</h1>"
     "<div class='card'><h3>Rede</h3><p>" + wifiStr + "</p></div>"
-    "<div class='card'><h3>Dispositivo</h3>"
-    "<p>" + validStr + " &nbsp; <b>" + deviceName + "</b></p></div>"
+    "<div class='card'><h3>API CaneOrbit</h3>"
+    "<p>" + apiStr + " &nbsp; (Device ID: <b>" + String(DEVICE_ID) + "</b>)</p></div>"
     "<div class='card'><h3>Sensores</h3>"
     "<p>Umidade do solo: <span class='val'>" + String(soilMoisture, 1) + "%</span></p>"
     "<p>Temperatura: <span class='val'>" + String(temperature, 1) + "&deg;C</span></p>"
-    "<p>Umidade do ar: <span class='val'>" + String(airHumidity, 1) + "%</span></p></div>"
+    "<p>Umidade do ar: <span class='val'>" + String(airHumidity, 1) + "%</span></p>"
+    "<p>pH do solo: <span class='val'>" + String(phSolo, 1) + "</span></p></div>"
     "<div class='card'><h3>Risco da Lavoura</h3>"
-    "<p>Nivel: <span class='val'>" + riscoStr + "</span></p>"
-    + (recommendation.length() > 0 ? "<p><i>" + recommendation + "</i></p>" : "") +
-    "</div>"
+    "<p>Nivel: <span class='val'>" + riscoStr + "</span></p></div>"
     "<p style='color:#aaa;font-size:12px'>Atualiza a cada 5s</p>"
     "</body></html>";
 
@@ -300,11 +314,12 @@ void handleDashboard() {
 // EP 1 — GET /sensor/leitura
 void handleGetLeitura() {
   JsonDocument doc;
-  doc["mac"]          = DEVICE_MAC;
-  doc["umidade_solo"] = soilMoisture;
-  doc["temperatura"]  = temperature;
-  doc["umidade_ar"]   = airHumidity;
-  doc["timestamp"]    = millis();
+  doc["idDispositivo"] = DEVICE_ID;
+  doc["umidadeSolo"]   = soilMoisture;
+  doc["temperatura"]   = temperature;
+  doc["umidadeAr"]     = airHumidity;
+  doc["phSolo"]        = phSolo;
+  doc["timestamp"]     = millis();
 
   String response;
   serializeJson(doc, response);
@@ -314,13 +329,11 @@ void handleGetLeitura() {
 // EP 2 — GET /sensor/status
 void handleGetStatus() {
   JsonDocument doc;
-  doc["mac"]          = DEVICE_MAC;
-  doc["validado"]     = deviceValidated;
-  doc["nome"]         = deviceName;
-  doc["fieldId"]      = deviceFieldId;
-  doc["risco"]        = riskLevel;
-  doc["recomendacao"] = recommendation;
-  doc["wifi"]         = WiFi.status() == WL_CONNECTED;
+  doc["idDispositivo"] = DEVICE_ID;
+  doc["apiConectada"]  = apiOk;
+  doc["risco"]         = riskLevel;
+  doc["wifi"]          = WiFi.status() == WL_CONNECTED;
+  doc["wifiRSSI"]      = WiFi.RSSI();
 
   String response;
   serializeJson(doc, response);

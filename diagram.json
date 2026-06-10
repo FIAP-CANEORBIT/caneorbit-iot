@@ -6,6 +6,7 @@
     { "type": "board-esp32-devkit-v1", "id": "esp32", "top": 131.68, "left": 206.4, "attrs": {} },
     { "type": "wokwi-dht22",           "id": "dht1",  "top": 0,      "left": 0,     "attrs": { "pin": "4" } },
     { "type": "wokwi-analog-joystick", "id": "soil1", "top": 0,      "left": 160,   "attrs": {} },
+    { "type": "wokwi-potentiometer",   "id": "ph1",   "top": 0,      "left": 320,   "attrs": { "label": "pH Solo" } },
     {
       "type": "wokwi-lcd1602",
       "id": "lcd1",
@@ -65,10 +66,14 @@
     [ "esp32:GND.1", "soil1:GND", "black", [] ],
     [ "esp32:3V3",   "soil1:VCC", "red",   [] ],
 
-    [ "lcd1:GND", "esp32:GND.2", "black",  [ "h0" ] ],
-    [ "lcd1:SDA", "esp32:D21",   "green",  [ "h0" ] ],
-    [ "lcd1:VCC", "esp32:3V3",   "red",    [ "h0" ] ],
-    [ "lcd1:SCL", "esp32:D22",   "green",  [ "h0" ] ],
+    [ "esp32:D35",   "ph1:SIG",   "purple", ["h0"] ],
+    [ "esp32:GND.1", "ph1:GND",   "black",  ["h0"] ],
+    [ "esp32:3V3",   "ph1:VCC",   "red",    ["h0"] ],
+
+    [ "lcd1:GND", "esp32:GND.2", "black", [ "h0" ] ],
+    [ "lcd1:SDA", "esp32:D21",   "green", [ "h0" ] ],
+    [ "lcd1:VCC", "esp32:3V3",   "red",   [ "h0" ] ],
+    [ "lcd1:SCL", "esp32:D22",   "green", [ "h0" ] ],
 
     [ "esp32:D25",   "r1:1",        "green", [ "h0" ] ],
     [ "r1:2",        "led_green:A", "green", [ "v0" ] ],
