@@ -20,7 +20,14 @@ const char* PASSWORD = "";
 // API Java em produção (Render)
 const char* API_BASE = "https://caneorbis-api-java.onrender.com";
 
+// Credenciais da conta CaneOrbit (mesma usada no app).
+// A API exige JWT em todas as rotas exceto login/register, então o
+// firmware faz login e envia o token Bearer no POST /api/leituras.
+const char* API_EMAIL = "SEU_EMAIL_AQUI";
+const char* API_SENHA = "SUA_SENHA_AQUI";
+
 // ID do dispositivo — obter após cadastrar via POST /api/dispositivos
+// (ou pelo app: Propriedade > dispositivo > ID exibido no detail)
 const int DEVICE_ID = 22;
 
 // ============ PINOS ============
@@ -38,6 +45,7 @@ WebServer         server(80);
 
 // ============ ESTADO GLOBAL ============
 bool    apiOk        = false;
+String  authToken    = "";      // JWT obtido via /api/auth/login
 String  deviceName   = "Sonda";
 float   soilMoisture = 0.0;
 float   temperature  = 0.0;
@@ -61,6 +69,8 @@ void calcularRisco();
 void lcdPrint(String linha1, String linha2);
 void updateDisplay();
 void readSensors();
+bool apiLogin();
+int  postLeitura();
 void sendSensorData();
 void handleDashboard();
 void handleGetLeitura();
@@ -234,9 +244,16 @@ void calcularRisco() {
 }
 
 // ============================================================
-//  COMUNICAÇÃO COM A API — POST /api/leituras
+//  COMUNICAÇÃO COM A API
 //
-//  Body enviado:
+//  A API Java exige JWT em todas as rotas exceto /api/auth/login
+//  e /api/usuarios/register. Fluxo do firmware:
+//
+//  1. POST /api/auth/login { email, senha } → guarda o token
+//  2. POST /api/leituras com header Authorization: Bearer <token>
+//  3. Se receber 401/403 (token expirou), renova o login e reenvia
+//
+//  Body da leitura:
 //  {
 //    "idDispositivo": 1,
 //    "umidadeSolo":   45.5,
@@ -246,17 +263,56 @@ void calcularRisco() {
 //
 //  Resposta 200/201 → LED verde acende
 // ============================================================
-void sendSensorData() {
+bool apiLogin() {
   HTTPClient http;
-  http.begin(String(API_BASE) + "/api/leituras");
+  http.begin(String(API_BASE) + "/api/auth/login");
   http.addHeader("Content-Type", "application/json");
   http.setTimeout(35000); // Render free tier pode demorar para acordar
 
   JsonDocument doc;
+  doc["email"] = API_EMAIL;
+  doc["senha"] = API_SENHA;
+  String body;
+  serializeJson(doc, body);
+
+  int code = http.POST(body);
+  Serial.println("[API] POST /api/auth/login → HTTP " + String(code));
+
+  bool ok = false;
+  if (code == 200) {
+    JsonDocument resp;
+    if (deserializeJson(resp, http.getString()) == DeserializationError::Ok &&
+        resp["token"].is<const char*>()) {
+      authToken = resp["token"].as<String>();
+      Serial.println("[API] Login ok — token JWT obtido");
+      ok = true;
+    } else {
+      Serial.println("[API] Login: resposta sem campo 'token'");
+    }
+  } else {
+    Serial.println("[API] Login falhou — confira API_EMAIL/API_SENHA");
+  }
+
+  if (!ok) authToken = "";
+  http.end();
+  return ok;
+}
+
+int postLeitura() {
+  HTTPClient http;
+  http.begin(String(API_BASE) + "/api/leituras");
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", "Bearer " + authToken);
+  http.setTimeout(35000);
+
+  // A API rejeita umidadeSolo <= 0 (@Positive) — garante mínimo 0.1
+  float umidade = soilMoisture < 0.1 ? 0.1 : soilMoisture;
+
+  JsonDocument doc;
   doc["idDispositivo"] = DEVICE_ID;
-  doc["umidadeSolo"]   = round(soilMoisture * 10) / 10.0;
-  doc["temperatura"]   = round(temperature  * 10) / 10.0;
-  doc["phSolo"]        = round(phSolo       * 10) / 10.0;
+  doc["umidadeSolo"]   = round(umidade     * 10) / 10.0;
+  doc["temperatura"]   = round(temperature * 10) / 10.0;
+  doc["phSolo"]        = round(phSolo      * 10) / 10.0;
 
   String body;
   serializeJson(doc, body);
@@ -265,11 +321,30 @@ void sendSensorData() {
   Serial.println("[API] POST /api/leituras → HTTP " + String(code));
   Serial.println("[API] Body: " + body);
 
+  http.end();
+  return code;
+}
+
+void sendSensorData() {
+  // Garante que há token antes de enviar
+  if (authToken.isEmpty() && !apiLogin()) {
+    apiOk = false;
+    setValidationLED(false);
+    return;
+  }
+
+  int code = postLeitura();
+
+  // Token expirado/inválido → renova uma vez e reenvia
+  if (code == 401 || code == 403) {
+    Serial.println("[API] Token expirado — renovando login...");
+    authToken = "";
+    if (apiLogin()) code = postLeitura();
+  }
+
   // LED verde = sucesso (200 ou 201), vermelho = falha
   apiOk = (code == 200 || code == 201);
   setValidationLED(apiOk);
-
-  http.end();
 }
 
 // ============================================================

@@ -98,9 +98,18 @@ A API Java está em produção no Render:
 
 **Base URL:** `https://caneorbis-api-java.onrender.com`
 
-### Endpoint consumido pelo ESP32
+### Endpoints consumidos pelo ESP32
 
-**`POST /api/leituras`** — sem autenticação
+A API exige **JWT** em todas as rotas exceto login/register. O firmware
+faz o login automaticamente e renova o token quando ele expira.
+
+**1. `POST /api/auth/login`** — obtém o token
+
+```json
+{ "email": "...", "senha": "..." }
+```
+
+**2. `POST /api/leituras`** — header `Authorization: Bearer <token>`
 
 ```json
 {
@@ -113,19 +122,26 @@ A API Java está em produção no Render:
 
 Resposta esperada: `201 Created`
 
-### Pré-requisito: cadastrar o dispositivo
+> A API rejeita `umidadeSolo` ≤ 0 — o firmware envia no mínimo `0.1`.
 
-Antes de rodar o firmware, é necessário registrar o dispositivo na API pelo Swagger (`/swagger-ui/index.html`) e obter o `id` retornado. Esse ID deve ser configurado no firmware:
+### Pré-requisitos: conta e dispositivo
+
+Configure no topo do `src/main.cpp`:
 
 ```cpp
-const int DEVICE_ID = 1; // substitua pelo id retornado
+const char* API_EMAIL = "SEU_EMAIL_AQUI";  // conta usada no app CaneOrbit
+const char* API_SENHA = "SUA_SENHA_AQUI";
+const int   DEVICE_ID = 1;                 // id do dispositivo cadastrado
 ```
 
-Fluxo de cadastro:
-1. `POST /api/usuarios/register` — criar conta
+O dispositivo deve existir na API. Cadastre pelo app CaneOrbit
+(Propriedade → "+") ou pelo Swagger (`/swagger-ui/index.html`):
+1. `POST /api/usuarios/register` — criar conta (se ainda não tiver)
 2. `POST /api/auth/login` — obter token JWT
 3. `POST /api/propriedades` — criar propriedade (requer token)
 4. `POST /api/dispositivos` — criar dispositivo (requer token) → **copiar o `id` retornado**
+
+O `id` do dispositivo também aparece no app, no detail do dispositivo.
 
 ---
 
