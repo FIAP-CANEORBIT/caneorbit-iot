@@ -15,6 +15,8 @@
 | Grazielle De Alencar | RM561529 |
 | Julia Corrêa | RM564870 |
 
+
+| **Video Projeto IOT (3 min)** | https://youtu.be/zTfWh0uC3Og |
 | **Video Pitch Projeto (3 min)** | https://youtu.be/izUM9V-_D7g |
 
 ---
